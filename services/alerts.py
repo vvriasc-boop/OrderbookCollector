@@ -17,13 +17,51 @@ from utils.helpers import (
 
 logger = logging.getLogger("orderbook_collector")
 
+
+# --- Spoof Tracker ---
+
+class SpoofTracker:
+    """Track walls that appear/disappear at the same price level repeatedly."""
+
+    EXPIRY_SEC = 3600  # forget after 1 hour
+
+    def __init__(self):
+        self.history: dict[str, list[float]] = {}  # key -> list of appearance timestamps
+
+    def record_appearance(self, market: str, side: str, price_str: str) -> int:
+        """Record wall appearance, return total count (including this one)."""
+        key = f"{market}:{side}:{price_str}"
+        now = time.time()
+        if key not in self.history:
+            self.history[key] = []
+        # Clean old entries
+        self.history[key] = [t for t in self.history[key] if now - t < self.EXPIRY_SEC]
+        self.history[key].append(now)
+        return len(self.history[key])
+
+    def get_count(self, market: str, side: str, price_str: str) -> int:
+        """Get current appearance count for a wall level."""
+        key = f"{market}:{side}:{price_str}"
+        now = time.time()
+        if key not in self.history:
+            return 0
+        self.history[key] = [t for t in self.history[key] if now - t < self.EXPIRY_SEC]
+        return len(self.history[key])
+
+    def cleanup(self):
+        """Remove expired entries."""
+        now = time.time()
+        to_remove = []
+        for key, timestamps in self.history.items():
+            timestamps[:] = [t for t in timestamps if now - t < self.EXPIRY_SEC]
+            if not timestamps:
+                to_remove.append(key)
+        for key in to_remove:
+            del self.history[key]
+
+
 # --- Alert type -> topic key mapping ---
 ALERT_TO_TOPIC = {
-    "wall_new":             "walls",
-    "wall_gone":            "walls",
-    "confirmed_wall":       "confirmed_walls",
-    "confirmed_wall_gone":  "confirmed_walls",
-    "large_trade":          "large_trades",
     "mega_trade":           "mega_events",
     "liquidation":          "liquidations",
     "mega_liq":             "mega_events",
@@ -58,7 +96,10 @@ class AlertManager:
 
     # --- Alert processors ---
 
-    async def process_wall_event(self, event: WallEvent):
+    async def process_wall_event(self, event: WallEvent,
+                                distance_pct: float | None = None,
+                                age_sec: float | None = None,
+                                spoof_count: int = 0):
         """New or gone wall."""
         if event.event_type == "new":
             alert_type = "wall_new"
@@ -66,12 +107,18 @@ class AlertManager:
             if not await self._should_send(alert_type, cooldown_key):
                 return
             price_f = event.price_float
-            text = (
-                f"\U0001f9f1 НОВАЯ СТЕНА — {event.market.title()} {event.side.upper()}\n"
-                f"\U0001f4b0 {format_usd(event.new_size_usd)} @ {format_price(price_f)}\n"
-                f"\U0001f552 {fmt_time_msk()}"
-            )
-            await self._enqueue(alert_type, text)
+            lines = [
+                f"\U0001f9f1 НОВАЯ СТЕНА — {event.market.title()} {event.side.upper()}",
+                f"\U0001f4b0 {format_usd(event.new_size_usd)} @ {format_price(price_f)}",
+            ]
+            if distance_pct is not None:
+                dist_dir = "ниже" if distance_pct < 0 else "выше"
+                lines.append(f"\U0001f4cf Расстояние: {format_pct(abs(distance_pct))} {dist_dir}")
+            if spoof_count >= 2:
+                lines.append(f"\u26a0\ufe0f Спуфинг? (замечена {spoof_count} раз за час)")
+            lines.append(f"\U0001f552 {fmt_time_msk()}")
+            topic = f"walls_{event.market}_{event.side}"
+            await self._enqueue(alert_type, "\n".join(lines), topic_key=topic)
 
         elif event.event_type in ("cancelled", "filled", "partial"):
             alert_type = "wall_gone"
@@ -83,13 +130,21 @@ class AlertManager:
                 "filled": "исполнена (цена коснулась)",
                 "partial": "частично исполнена",
             }
-            text = (
-                f"\U0001f4a5 СТЕНА СНЯТА — {event.market.title()} {event.side.upper()}\n"
-                f"\U0001f4b0 {format_usd(event.old_size_usd)} @ {format_price(event.price_float)}\n"
-                f"\U0001f4ca Причина: {reason_map.get(event.event_type, event.event_type)}\n"
-                f"\U0001f552 {fmt_time_msk()}"
-            )
-            await self._enqueue(alert_type, text)
+            lines = [
+                f"\U0001f4a5 СТЕНА СНЯТА — {event.market.title()} {event.side.upper()}",
+                f"\U0001f4b0 {format_usd(event.old_size_usd)} @ {format_price(event.price_float)}",
+            ]
+            if distance_pct is not None:
+                dist_dir = "ниже" if distance_pct < 0 else "выше"
+                lines.append(f"\U0001f4cf Расстояние: {format_pct(abs(distance_pct))} {dist_dir}")
+            if age_sec is not None:
+                lines.append(f"\u23f1 Стояла: {format_duration(age_sec)}")
+            lines.append(f"\U0001f4ca Причина: {reason_map.get(event.event_type, event.event_type)}")
+            if spoof_count >= 2:
+                lines.append(f"\u26a0\ufe0f Спуфинг? (замечена {spoof_count} раз за час)")
+            lines.append(f"\U0001f552 {fmt_time_msk()}")
+            topic = f"walls_{event.market}_{event.side}"
+            await self._enqueue(alert_type, "\n".join(lines), topic_key=topic)
 
     async def process_large_trade(self, event: LargeTradeEvent):
         """Large trade alert."""
@@ -111,7 +166,8 @@ class AlertManager:
             f" @ {format_price(event.price)}\n"
             f"\U0001f552 {fmt_time_msk(event.timestamp)}"
         )
-        await self._enqueue(alert_type, text)
+        topic = f"trades_{event.market}_{event.side}"
+        await self._enqueue(alert_type, text, topic_key=topic)
 
     async def process_liquidation(self, event: LiqEvent):
         """Liquidation alert. >=1M -> mega_events topic, else liquidations topic."""
@@ -188,7 +244,8 @@ class AlertManager:
             f"\U0001f552 Обнаружена: {fmt_time_msk(wall_data['detected_at'])}\n"
             f"\U0001f552 Подтверждена: {fmt_time_msk()}"
         )
-        await self._enqueue(alert_type, text)
+        topic = f"confirmed_walls_{wall_data['market']}"
+        await self._enqueue(alert_type, text, topic_key=topic)
 
     async def process_confirmed_wall_gone(self, wall_data: dict, reason: str):
         """Confirmed wall removed/filled."""
@@ -211,7 +268,8 @@ class AlertManager:
             f"\U0001f4ca Причина: {reason_map.get(reason, reason)}\n"
             f"\U0001f552 {fmt_time_msk()}"
         )
-        await self._enqueue(alert_type, text)
+        topic = f"confirmed_walls_{wall_data['market']}"
+        await self._enqueue(alert_type, text, topic_key=topic)
 
     async def send_system_message(self, text: str):
         """Send message to system topic."""
@@ -241,9 +299,9 @@ class AlertManager:
         self.last_alerts[key] = now
         return True
 
-    async def _enqueue(self, alert_type: str, text: str):
+    async def _enqueue(self, alert_type: str, text: str, topic_key: str | None = None):
         await database.insert_alert_log(alert_type, text)
-        await self.queue.put({"type": alert_type, "text": text, "time": time.time()})
+        await self.queue.put({"type": alert_type, "text": text, "time": time.time(), "topic": topic_key})
 
     async def _send_loop(self):
         """Send alerts from queue with batching and delay."""
@@ -259,21 +317,22 @@ class AlertManager:
                     except asyncio.QueueEmpty:
                         break
 
-                # Group by type
-                groups: dict[str, list] = {}
+                # Group by (type, topic) to keep different topics separate
+                groups: dict[tuple, list] = {}
                 for m in batch:
-                    groups.setdefault(m["type"], []).append(m)
+                    key = (m["type"], m.get("topic"))
+                    groups.setdefault(key, []).append(m)
 
-                for alert_type, msgs in groups.items():
+                for (alert_type, topic_key), msgs in groups.items():
                     if len(msgs) > config.ALERT_BATCH_THRESHOLD:
                         header = f"\u26a1\ufe0f {len(msgs)} событий ({alert_type}):\n\n"
                         combined = header + "\n---\n".join(m["text"] for m in msgs[:10])
                         if len(msgs) > 10:
                             combined += f"\n\n...и ещё {len(msgs) - 10}"
-                        await self._send_to_topic(alert_type, combined)
+                        await self._send_to_topic(alert_type, combined, topic_key)
                     else:
                         for m in msgs:
-                            await self._send_to_topic(alert_type, m["text"])
+                            await self._send_to_topic(alert_type, m["text"], topic_key)
                             if len(msgs) > 1:
                                 await asyncio.sleep(config.TELEGRAM_DELAY_SEC)
 
@@ -283,9 +342,9 @@ class AlertManager:
                 logger.error("Alert send_loop error: %s", e)
                 await asyncio.sleep(1)
 
-    async def _send_to_topic(self, alert_type: str, text: str):
+    async def _send_to_topic(self, alert_type: str, text: str, topic_override: str | None = None):
         """Send message to the appropriate forum topic."""
-        topic_key = ALERT_TO_TOPIC.get(alert_type, "system")
+        topic_key = topic_override or ALERT_TO_TOPIC.get(alert_type, "system")
         thread_id = config.TOPIC_IDS.get(topic_key)
 
         chat_id = config.FORUM_GROUP_ID

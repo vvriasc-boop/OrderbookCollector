@@ -11,7 +11,7 @@ from database import db as database
 from services.orderbook import OrderBook, WallEvent
 from services.trades import TradeAggregator
 from services.liquidations import on_liquidation
-from services.alerts import AlertManager, ConfirmedWallChecker
+from services.alerts import AlertManager, ConfirmedWallChecker, SpoofTracker
 from services.ws_manager import WSManager
 from services.snapshots import (
     fetch_rest_snapshot,
@@ -37,9 +37,16 @@ logger.addHandler(logging.StreamHandler())
 
 
 REQUIRED_TOPICS = {
-    "walls": "🧱 Стены",
-    "confirmed_walls": "🏰 Подтверждённые стены",
-    "large_trades": "🐋 Крупные сделки",
+    "walls_futures_bid": "🧱 Стены Futures BID",
+    "walls_futures_ask": "🧱 Стены Futures ASK",
+    "walls_spot_bid": "🧱 Стены Spot BID",
+    "walls_spot_ask": "🧱 Стены Spot ASK",
+    "confirmed_walls_futures": "🏰 Подтв. стены Futures",
+    "confirmed_walls_spot": "🏰 Подтв. стены Spot",
+    "trades_futures_buy": "🐋 Сделки Futures BUY",
+    "trades_futures_sell": "🐋 Сделки Futures SELL",
+    "trades_spot_buy": "🐋 Сделки Spot BUY",
+    "trades_spot_sell": "🐋 Сделки Spot SELL",
     "mega_events": "🚨 Мега-события",
     "liquidations": "💀 Ликвидации",
     "cvd_imbalance": "📊 CVD / Дисбаланс",
@@ -116,6 +123,9 @@ async def main():
 
     # 4.1 Init ConfirmedWallChecker
     confirmed_wall_checker = ConfirmedWallChecker()
+
+    # 4.2 Init SpoofTracker
+    spoof_tracker = SpoofTracker()
 
     # 5. Init OrderBooks
     ob_futures = OrderBook("futures", config.WALL_THRESHOLD_USD, is_futures=True)
@@ -202,24 +212,49 @@ async def main():
                 wall_id=wall_id,
                 detected_at=time.time(),
             )
+
+            # Track spoofing
+            spoof_count = spoof_tracker.record_appearance(we.market, we.side, we.price_str)
+
             # Alert only for big walls
             if we.new_size_usd >= config.WALL_ALERT_USD:
-                await alert_manager.process_wall_event(we)
+                await alert_manager.process_wall_event(
+                    we, distance_pct=distance, spoof_count=spoof_count,
+                )
 
             # Track for confirmed wall check
             confirmed_wall_checker.on_wall_detected(we, mid)
 
         elif we.event_type in ("cancelled", "filled", "partial"):
+            # Get wall info BEFORE unregistering (for age calculation)
+            wall_info = await ob.get_wall_info(we.price_str)
+            age_sec = None
+            if wall_info:
+                age_sec = time.time() - wall_info.detected_at
+
             if we.wall_id:
                 mid = (await ob.get_status())["mid"]
                 await database.update_wall_status(
                     we.wall_id, we.event_type, we.event_type, mid,
                 )
+            else:
+                mid = (await ob.get_status())["mid"]
+
             await ob.unregister_wall(we.price_str)
+
+            # Compute distance
+            price_f = we.price_float
+            distance = ((price_f - mid) / mid * 100) if mid > 0 else 0
+
+            # Get spoof count
+            spoof_count = spoof_tracker.get_count(we.market, we.side, we.price_str)
 
             # Alert only for significant walls
             if we.old_size_usd >= config.WALL_CANCEL_ALERT_USD:
-                await alert_manager.process_wall_event(we)
+                await alert_manager.process_wall_event(
+                    we, distance_pct=distance, age_sec=age_sec,
+                    spoof_count=spoof_count,
+                )
 
             # Check if confirmed wall was removed
             gone_pw = confirmed_wall_checker.on_wall_gone(we)

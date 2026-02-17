@@ -273,6 +273,11 @@ class OrderBook:
                 detected_at=detected_at,
             )
 
+    async def get_wall_info(self, price_str: str) -> WallInfo | None:
+        """Get wall info by price. Must be called BEFORE unregister_wall."""
+        async with self.lock:
+            return self.tracked_walls.get(price_str)
+
     async def unregister_wall(self, price_str: str):
         """Remove wall from tracked_walls. Called after DB status update."""
         async with self.lock:

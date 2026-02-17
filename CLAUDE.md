@@ -1,12 +1,12 @@
 # OrderbookCollector
 
-Telegram-бот для мониторинга BTC ордербука Binance в реальном времени. Собирает данные по лимитным ордерам, крупным сделкам и ликвидациям через WebSocket, хранит в SQLite, отправляет алерты.
+Telegram-бот для мониторинга BTC ордербука Binance в реальном времени. Собирает данные по лимитным ордерам, крупным сделкам и ликвидациям через WebSocket, хранит в SQLite, отправляет алерты в Telegram Forum Topics.
 
 ## Структура проекта
 
 ```
 OrderbookCollector/
-├── main.py              ← запуск, init, graceful shutdown
+├── main.py              ← запуск, init, graceful shutdown, ensure_forum_topics
 ├── config.py            ← .env, константы, пороги, http_session
 ├── .env                 ← API ключи (не коммитить)
 ├── requirements.txt
@@ -18,35 +18,38 @@ OrderbookCollector/
 ├── services/
 │   ├── __init__.py
 │   ├── ws_manager.py    ← WebSocket подключения, reconnect, proxy
-│   ├── orderbook.py     ← ордербук в памяти, диффы, wall detection
+│   ├── orderbook.py     ← ордербук в памяти, диффы, wall detection, WallInfo
 │   ├── trades.py        ← агрегация сделок, CVD, крупные сделки
 │   ├── liquidations.py  ← фильтрация и хранение ликвидаций
-│   ├── alerts.py        ← алерты, cooldown, batching, Telegram
-│   └── snapshots.py     ← REST снапшоты, периодические задачи
+│   ├── alerts.py        ← AlertManager, ConfirmedWallChecker, SpoofTracker
+│   └── snapshots.py     ← REST снапшоты, периодические задачи, confirmed_wall_check_loop
 ├── handlers/
 │   ├── __init__.py
-│   ├── commands.py      ← /start, /status, /walls, /trades, /liq, /cvd, /depth, /stats, /notify
+│   ├── commands.py      ← /start /status /walls /trades /liq /cvd /depth /stats /notify /topics /help
 │   ├── callbacks.py     ← роутер inline-кнопок
 │   └── keyboards.py     ← InlineKeyboardMarkup
 └── utils/
     ├── __init__.py
-    └── helpers.py        ← форматирование, split_text
+    └── helpers.py        ← форматирование, split_text, fmt_time_msk
 ```
 
 ## Запуск
 
 ```bash
-# Заполнить .env (TELEGRAM_BOT_TOKEN, ADMIN_USER_ID, опционально PROXY_URL)
+# Заполнить .env (TELEGRAM_BOT_TOKEN, ADMIN_USER_ID, FORUM_GROUP_ID)
 pip install -r requirements.txt
 python main.py
 ```
 
-## Перезапуск
+## Systemd (автозапуск)
 
 ```bash
-# Graceful (отправляет SIGTERM)
-kill -SIGTERM $(pgrep -f "python main.py")
-# Или Ctrl+C (SIGINT)
+# Сервис: /etc/systemd/system/orderbook-collector.service
+sudo systemctl start orderbook-collector
+sudo systemctl stop orderbook-collector
+sudo systemctl restart orderbook-collector
+sudo systemctl status orderbook-collector
+journalctl -u orderbook-collector -f   # логи
 ```
 
 ## .env параметры
@@ -55,9 +58,67 @@ kill -SIGTERM $(pgrep -f "python main.py")
 |----------|:---:|----------|
 | TELEGRAM_BOT_TOKEN | да | Токен Telegram-бота от @BotFather |
 | ADMIN_USER_ID | да | Telegram user ID для алертов |
+| FORUM_GROUP_ID | да | ID супергруппы с Forum Topics (отрицательное число) |
 | PROXY_URL | нет | HTTP/SOCKS5 прокси для Binance |
 | WALL_THRESHOLD_USD | нет | Порог "стены" (дефолт: 500000) |
 | LARGE_TRADE_THRESHOLD_USD | нет | Порог крупной сделки (дефолт: 100000) |
+
+## Telegram Forum Topics
+
+Алерты маршрутизируются в 15 отдельных топиков. Топики создаются автоматически при первом запуске через `ensure_forum_topics()`, thread_id сохраняются в таблицу `forum_topics`.
+
+### Маршрутизация алертов
+
+| Топик | Что попадает | Механизм |
+|-------|-------------|----------|
+| `walls_futures_bid` | Стены Futures BID (new/gone) | topic_key override |
+| `walls_futures_ask` | Стены Futures ASK (new/gone) | topic_key override |
+| `walls_spot_bid` | Стены Spot BID (new/gone) | topic_key override |
+| `walls_spot_ask` | Стены Spot ASK (new/gone) | topic_key override |
+| `trades_futures_buy` | Сделки Futures BUY | topic_key override |
+| `trades_futures_sell` | Сделки Futures SELL | topic_key override |
+| `trades_spot_buy` | Сделки Spot BUY | topic_key override |
+| `trades_spot_sell` | Сделки Spot SELL | topic_key override |
+| `confirmed_walls_futures` | Подтв. стены Futures | topic_key override |
+| `confirmed_walls_spot` | Подтв. стены Spot | topic_key override |
+| `mega_events` | Мега-сделки + мега-ликвидации | ALERT_TO_TOPIC static |
+| `liquidations` | Ликвидации | ALERT_TO_TOPIC static |
+| `cvd_imbalance` | CVD / Дисбаланс | ALERT_TO_TOPIC static |
+| `digests` | Дайджесты | ALERT_TO_TOPIC static |
+| `system` | Системные сообщения | ALERT_TO_TOPIC static |
+
+**Два механизма маршрутизации:**
+- `ALERT_TO_TOPIC` dict — статическое сопоставление alert_type → topic_key (для типов с одним топиком)
+- `topic_key` override через `_enqueue(topic_key=...)` — динамическое, формируется из market+side (для стен, сделок, подтв. стен)
+
+## Детекция стен (Wall Detection)
+
+### Пороги
+
+| Порог | Значение | Назначение |
+|-------|---------|------------|
+| WALL_THRESHOLD_USD | $500K | Порог обнаружения стены в OrderBook |
+| WALL_ALERT_USD | $2M | Порог алерта новой стены |
+| WALL_CANCEL_ALERT_USD | $1M | Порог алерта снятой стены |
+| CONFIRMED_WALL_THRESHOLD_USD | $5M | Порог подтверждённой стены |
+| CONFIRMED_WALL_MAX_DISTANCE_PCT | 2% | Макс. расстояние от mid для подтверждения |
+| CONFIRMED_WALL_DELAY_SEC | 60 сек | Минимальное время жизни для подтверждения |
+
+### Подтверждённые стены (ConfirmedWallChecker)
+
+Стена >= $5M, в пределах ±2% от mid, простоявшая >= 60 сек → алерт "подтверждённая стена". Проверка каждые 10 сек в `confirmed_wall_check_loop`. При снятии подтверждённой стены — отдельный алерт.
+
+### Спуфинг-детекция (SpoofTracker)
+
+`SpoofTracker` в `alerts.py` считает сколько раз стена появлялась на одном уровне `market:side:price_str` за последний час. Если count >= 2 — в алерте показывается предупреждение о возможном спуфинге.
+
+### Алерты стен содержат
+
+- Объём и цена
+- Расстояние до mid price (% выше/ниже)
+- Время жизни стены (для снятых)
+- Причина снятия (отменена/исполнена/частично)
+- Предупреждение о спуфинге (если count >= 2)
 
 ## Таблицы БД
 
@@ -68,6 +129,7 @@ kill -SIGTERM $(pgrep -f "python main.py")
 - `ob_snapshots_1m` — снапшоты глубины ордербука каждую минуту
 - `alerts_log` — лог отправленных алертов
 - `notification_settings` — настройки уведомлений (вкл/выкл по типам)
+- `forum_topics` — topic_key → thread_id маппинг
 
 ## WebSocket: combined stream формат
 
@@ -85,7 +147,7 @@ Binance combined stream оборачивает события:
 - **State recovery**: при старте загружаются active walls из БД и CVD из trade_aggregates_1m.
 - **Exponential backoff**: WS reconnect 5→10→20→...→300 сек. Сброс при первом сообщении.
 - **Pruning**: раз в минуту удаляются уровни дальше 50% от mid_price (memory management).
-- **Batching alerts**: если >3 алертов одного типа за 0.3 сек — объединяются в одно сообщение.
+- **Batching alerts**: если >3 алертов одного типа за 0.3 сек — объединяются в одно сообщение. Группировка по (alert_type, topic_key).
 
 ## Разница Futures vs Spot diff-логики
 
@@ -107,14 +169,35 @@ python3 -m py_compile main.py
 python3 -m py_compile config.py
 python3 -m py_compile database/db.py
 python3 -m py_compile services/orderbook.py
+python3 -m py_compile services/alerts.py
 
-# Запуск
+# Запуск (ручной)
 python main.py
 
-# Перезапуск
-kill -SIGTERM $(pgrep -f "python main.py") && sleep 2 && python main.py
+# Управление (systemd)
+sudo systemctl restart orderbook-collector
 ```
+
+## Critical Rules
+
+- **get_wall_info() ПЕРЕД unregister_wall()**: при обработке снятия стены в `_process_wall_event`, данные о стене (detected_at для возраста) нужно получить ДО вызова `unregister_wall()`, иначе данные потеряны.
+- **list() при итерации dict с await**: `for key, val in self.pending.items()` с `await` внутри цикла — RuntimeError. Использовать `list(self.pending.items())`.
+- **distance_pct — знаковая величина**: не использовать `abs()` при сохранении distance_pct. Знак нужен для отображения "ниже"/"выше". Фильтры используют `abs()` явно.
 
 ## Lessons Learned
 
-(пополнять по мере разработки)
+### Async
+**[2026-02-18]** RuntimeError: dictionary changed size during iteration
+
+- **Симптом:** Крэш в `check_confirmations` при итерации `self.pending.items()`
+- **Причина:** `await` внутри цикла отдаёт управление, другой корутин модифицирует dict
+- **Решение:** `for key, pw in list(self.pending.items()):`
+- **При повторении:** Любой `for ... in dict.items()` с `await` внутри — обернуть в `list()`
+
+### Config
+**[2026-02-18]** FORUM_GROUP_ID: "The chat is not a forum"
+
+- **Симптом:** Ошибка при создании Forum Topics
+- **Причина:** При включении Topics группа мигрирует в супергруппу с новым ID
+- **Решение:** Использовать новый ID супергруппы (начинается с -100)
+- **При повторении:** После включения Topics проверить новый chat_id через Telegram API
