@@ -67,16 +67,19 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "wall_gone": ("\U0001f4a5 Стены сняты", "$1M+"),
             "large_trade": ("\U0001f40b Крупные сделки", "$500K+"),
             "mega_trade": ("\U0001f6a8 Мега-сделки", "$2M+"),
-            "liquidation": ("\U0001f480 Ликвидации", "$1M+"),
+            "liquidation": ("\U0001f480 Ликвидации", ""),
+            "mega_liq": ("\U0001f480 Мега-ликвидации", "$1M+"),
             "cvd_spike": ("\U0001f4ca CVD спайки", "$5M/5m"),
             "imbalance": ("\u2696\ufe0f Дисбаланс", ">40%"),
             "confirmed_wall": ("\U0001f3f0 Стена $5M+", "\u00b12%, 1мин"),
+            "confirmed_wall_gone": ("\U0001f3f0\u274c Стена снята", "$5M+"),
         }
         text = "\U0001f514 Настройки уведомлений\n\n"
         for at, (label, threshold) in labels.items():
             enabled = settings.get(at, True)
             icon = "\u2705 Вкл" if enabled else "\u274c Выкл"
-            text += f"{label} ({threshold})     [{icon}]\n"
+            thr_str = f" ({threshold})" if threshold else ""
+            text += f"{label}{thr_str}     [{icon}]\n"
         text += "\nНажмите для переключения:"
         await query.edit_message_text(text, reply_markup=notify_keyboard(settings))
 

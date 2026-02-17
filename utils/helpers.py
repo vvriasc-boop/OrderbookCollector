@@ -1,5 +1,7 @@
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+MSK = timezone(timedelta(hours=3))
 
 
 def format_usd(value: float) -> str:
@@ -52,6 +54,22 @@ def format_timestamp(ts: float) -> str:
     """Format unix timestamp to HH:MM:SS."""
     dt = datetime.fromtimestamp(ts, tz=timezone.utc)
     return dt.strftime("%H:%M:%S")
+
+
+def fmt_time_msk(ts: float | None = None) -> str:
+    """Format timestamp as Moscow time HH:MM:SS MSK."""
+    if ts is None:
+        ts = time.time()
+    dt = datetime.fromtimestamp(ts, tz=MSK)
+    return dt.strftime("%H:%M:%S MSK")
+
+
+def fmt_datetime_msk(ts: float | None = None) -> str:
+    """Format timestamp as Moscow time with date: DD.MM HH:MM:SS MSK."""
+    if ts is None:
+        ts = time.time()
+    dt = datetime.fromtimestamp(ts, tz=MSK)
+    return dt.strftime("%d.%m %H:%M:%S MSK")
 
 
 def delta_arrow(value: float) -> str:

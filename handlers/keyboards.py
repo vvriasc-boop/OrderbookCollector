@@ -54,9 +54,11 @@ def notify_keyboard(settings: dict) -> InlineKeyboardMarkup:
         "large_trade": "\U0001f40b Сделки",
         "mega_trade": "\U0001f6a8 Мега",
         "liquidation": "\U0001f480 Ликвид",
+        "mega_liq": "\U0001f480 МегаЛик",
         "cvd_spike": "\U0001f4ca CVD",
         "imbalance": "\u2696\ufe0f Баланс",
         "confirmed_wall": "\U0001f3f0 $5M+",
+        "confirmed_wall_gone": "\U0001f3f0\u274c Снята",
     }
 
     buttons = []

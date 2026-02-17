@@ -11,17 +11,18 @@ from database import db as database
 from services.orderbook import OrderBook, WallEvent, WallInfo
 from services.trades import TradeAggregator
 from services.liquidations import on_liquidation
-from services.alerts import AlertManager
+from services.alerts import AlertManager, ConfirmedWallChecker
 from services.ws_manager import WSManager
 from services.snapshots import (
     fetch_rest_snapshot,
     periodic_snapshot_loop,
     periodic_rest_refresh,
     periodic_archive_cleanup,
+    confirmed_wall_check_loop,
 )
 from handlers.commands import (
     cmd_start, cmd_status, cmd_walls, cmd_trades,
-    cmd_liq, cmd_cvd, cmd_depth, cmd_stats, cmd_notify, cmd_help,
+    cmd_liq, cmd_cvd, cmd_depth, cmd_stats, cmd_notify, cmd_help, cmd_topics,
 )
 from handlers.callbacks import callback_router
 
@@ -33,6 +34,48 @@ file_handler = RotatingFileHandler("bot.log", maxBytes=10 * 1024 * 1024, backupC
 file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
 logger.addHandler(file_handler)
 logger.addHandler(logging.StreamHandler())
+
+
+REQUIRED_TOPICS = {
+    "walls": "🧱 Стены",
+    "confirmed_walls": "🏰 Подтверждённые стены",
+    "large_trades": "🐋 Крупные сделки",
+    "mega_events": "🚨 Мега-события",
+    "liquidations": "💀 Ликвидации",
+    "cvd_imbalance": "📊 CVD / Дисбаланс",
+    "digests": "📋 Дайджесты",
+    "system": "⚙️ Система",
+}
+
+
+async def ensure_forum_topics(bot):
+    """Create forum topics if they don't exist, populate config.TOPIC_IDS."""
+    if not config.FORUM_GROUP_ID:
+        logger.warning("FORUM_GROUP_ID not set, skipping topic creation")
+        return
+
+    # Load existing from DB
+    existing = database.db_get_all_topics()
+    config.TOPIC_IDS.update(existing)
+
+    for topic_key, topic_name in REQUIRED_TOPICS.items():
+        if topic_key in config.TOPIC_IDS:
+            logger.info("Topic '%s' already exists (thread_id=%d)", topic_key, config.TOPIC_IDS[topic_key])
+            continue
+
+        try:
+            result = await bot.create_forum_topic(
+                chat_id=config.FORUM_GROUP_ID,
+                name=topic_name,
+            )
+            thread_id = result.message_thread_id
+            config.TOPIC_IDS[topic_key] = thread_id
+            database.db_save_topic(topic_key, thread_id)
+            logger.info("Created topic '%s' -> thread_id=%d", topic_key, thread_id)
+        except Exception as e:
+            logger.error("Failed to create topic '%s': %s", topic_key, e)
+
+    logger.info("Forum topics ready: %s", config.TOPIC_IDS)
 
 
 async def main():
@@ -64,9 +107,15 @@ async def main():
         database.close_database()
         return
 
+    # 3.1 Ensure forum topics exist
+    await ensure_forum_topics(app.bot)
+
     # 4. Init AlertManager
     alert_manager = AlertManager(app.bot, config.ADMIN_USER_ID, config.ALERT_COOLDOWN_SEC)
     alert_manager.start()
+
+    # 4.1 Init ConfirmedWallChecker
+    confirmed_wall_checker = ConfirmedWallChecker()
 
     # 5. Init OrderBooks
     ob_futures = OrderBook("futures", config.WALL_THRESHOLD_USD, is_futures=True)
@@ -157,6 +206,9 @@ async def main():
             if we.new_size_usd >= config.WALL_ALERT_USD:
                 await alert_manager.process_wall_event(we)
 
+            # Track for confirmed wall check
+            confirmed_wall_checker.on_wall_detected(we, mid)
+
         elif we.event_type in ("cancelled", "filled", "partial"):
             if we.wall_id:
                 mid = (await ob.get_status())["mid"]
@@ -168,6 +220,19 @@ async def main():
             # Alert only for significant walls
             if we.old_size_usd >= config.WALL_CANCEL_ALERT_USD:
                 await alert_manager.process_wall_event(we)
+
+            # Check if confirmed wall was removed
+            gone_pw = confirmed_wall_checker.on_wall_gone(we)
+            if gone_pw:
+                wall_data = {
+                    "market": gone_pw.market,
+                    "side": gone_pw.side,
+                    "price": float(gone_pw.price_str),
+                    "size_usd": gone_pw.size_usd,
+                    "distance_pct": gone_pw.distance_pct,
+                    "detected_at": gone_pw.detected_at,
+                }
+                await alert_manager.process_confirmed_wall_gone(wall_data, we.event_type)
 
     # 8. Init WSManager
     ws_manager = WSManager(
@@ -184,6 +249,7 @@ async def main():
     app.bot_data["alert_manager"] = alert_manager
     app.bot_data["trade_agg_futures"] = trade_agg_futures
     app.bot_data["trade_agg_spot"] = trade_agg_spot
+    app.bot_data["confirmed_wall_checker"] = confirmed_wall_checker
 
     # Register Telegram handlers
     app.add_handler(CommandHandler("start", cmd_start))
@@ -195,6 +261,7 @@ async def main():
     app.add_handler(CommandHandler("depth", cmd_depth))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("notify", cmd_notify))
+    app.add_handler(CommandHandler("topics", cmd_topics))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(callback_router))
 
@@ -203,6 +270,7 @@ async def main():
     logger.info("WebSocket connections started")
 
     # 10. Start periodic tasks
+    orderbooks = {"futures": ob_futures, "spot": ob_spot}
     periodic_tasks = [
         asyncio.create_task(
             periodic_snapshot_loop(ob_futures, ob_spot, alert_manager,
@@ -213,6 +281,10 @@ async def main():
         asyncio.create_task(periodic_archive_cleanup(), name="archive-cleanup"),
         asyncio.create_task(_healthcheck_loop(ws_manager, ob_futures, ob_spot, alert_manager),
                            name="healthcheck"),
+        asyncio.create_task(
+            confirmed_wall_check_loop(confirmed_wall_checker, orderbooks, alert_manager),
+            name="confirmed-wall-checker",
+        ),
     ]
 
     # 11. Start Telegram bot
@@ -221,6 +293,12 @@ async def main():
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
         logger.info("Telegram bot started")
+
+        # Send startup message to system topic
+        await alert_manager.send_system_message(
+            "✅ OrderbookCollector запущен\n"
+            f"📡 Topics: {len(config.TOPIC_IDS)} / {len(REQUIRED_TOPICS)}"
+        )
     except Exception as e:
         logger.error("Failed to start Telegram bot: %s", e)
         await ws_manager.stop()
@@ -313,7 +391,7 @@ async def _healthcheck_loop(ws_manager, ob_futures, ob_spot, alert_manager):
                 msg = "\u26a0\ufe0f Healthcheck issues:\n" + "\n".join(f"  - {i}" for i in issues)
                 logger.warning(msg)
                 if consecutive_failures >= 3:
-                    await alert_manager.send_admin_message(msg)
+                    await alert_manager.send_system_message(msg)
                     consecutive_failures = 0
             else:
                 consecutive_failures = 0

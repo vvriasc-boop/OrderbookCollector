@@ -7,6 +7,10 @@ load_dotenv()
 # --- Telegram ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID") or "0")
+FORUM_GROUP_ID = int(os.getenv("FORUM_GROUP_ID") or "0")
+
+# Mapping alert_type -> message_thread_id (populated at startup)
+TOPIC_IDS: dict[str, int] = {}
 
 # --- Proxy ---
 PROXY_URL = os.getenv("PROXY_URL", "")
@@ -16,8 +20,8 @@ WALL_THRESHOLD_USD = float(os.getenv("WALL_THRESHOLD_USD") or "500000")
 WALL_ALERT_USD = 2_000_000
 WALL_CANCEL_ALERT_USD = 1_000_000
 CONFIRMED_WALL_THRESHOLD_USD = 5_000_000
-CONFIRMED_WALL_DISTANCE_PCT = 0.02  # 2%
-CONFIRMED_WALL_MIN_AGE_SEC = 60  # 1 minute
+CONFIRMED_WALL_MAX_DISTANCE_PCT = 2.0  # max 2% from mid_price
+CONFIRMED_WALL_DELAY_SEC = 60  # confirm after 60 seconds
 
 # --- Trades ---
 LARGE_TRADE_THRESHOLD_USD = float(os.getenv("LARGE_TRADE_THRESHOLD_USD") or "100000")

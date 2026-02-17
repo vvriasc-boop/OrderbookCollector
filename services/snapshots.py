@@ -69,12 +69,6 @@ async def periodic_snapshot_loop(ob_futures, ob_spot, alert_manager,
                     if abs(imb_1pct) > config.IMBALANCE_ALERT_THRESHOLD:
                         await alert_manager.process_imbalance(imb_1pct, ob.market)
 
-            # Confirmed wall check ($5M+, ±2%, stood >= 1 min)
-            for ob in [ob_futures, ob_spot]:
-                confirmed = await ob.get_walls_for_confirmed_alert()
-                for cw in confirmed:
-                    await alert_manager.process_confirmed_wall(cw)
-
             # CVD spike check (last 5 minutes)
             five_min_ago = now_ts - 300
             for market, agg in [("futures", trade_agg_futures), ("spot", trade_agg_spot)]:
@@ -100,6 +94,30 @@ async def periodic_snapshot_loop(ob_futures, ob_spot, alert_manager,
             raise
         except Exception as e:
             logger.error("periodic_snapshot_loop error: %s", e)
+            await asyncio.sleep(5)
+
+
+async def confirmed_wall_check_loop(confirmed_checker, orderbooks, alert_manager):
+    """Every 10s: check pending walls for confirmation ($5M+, ±2%, 1 min)."""
+    while True:
+        try:
+            await asyncio.sleep(10)
+            confirmed = await confirmed_checker.check_confirmations(orderbooks)
+            for pw in confirmed:
+                wall_data = {
+                    "market": pw.market,
+                    "side": pw.side,
+                    "price": float(pw.price_str),
+                    "size_usd": pw.size_usd,
+                    "distance_pct": pw.distance_pct,
+                    "age_sec": time.time() - pw.detected_at,
+                    "detected_at": pw.detected_at,
+                }
+                await alert_manager.process_confirmed_wall(wall_data)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("confirmed_wall_check_loop error: %s", e)
             await asyncio.sleep(5)
 
 

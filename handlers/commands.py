@@ -9,7 +9,7 @@ from database import db as database
 from handlers.keyboards import main_menu_keyboard, stats_period_keyboard, notify_keyboard, back_keyboard
 from utils.helpers import (
     format_usd, format_price, format_duration, format_pct,
-    delta_arrow, imbalance_bar, split_text,
+    delta_arrow, imbalance_bar, split_text, fmt_time_msk,
 )
 
 logger = logging.getLogger("orderbook_collector")
@@ -403,17 +403,20 @@ async def cmd_notify(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "wall_gone": ("\U0001f4a5 Стены сняты", "$1M+"),
         "large_trade": ("\U0001f40b Крупные сделки", "$500K+"),
         "mega_trade": ("\U0001f6a8 Мега-сделки", "$2M+"),
-        "liquidation": ("\U0001f480 Ликвидации", "$1M+"),
+        "liquidation": ("\U0001f480 Ликвидации", ""),
+        "mega_liq": ("\U0001f480 Мега-ликвидации", "$1M+"),
         "cvd_spike": ("\U0001f4ca CVD спайки", "$5M/5m"),
         "imbalance": ("\u2696\ufe0f Дисбаланс", ">40%"),
         "confirmed_wall": ("\U0001f3f0 Стена $5M+", "\u00b12%, 1мин"),
+        "confirmed_wall_gone": ("\U0001f3f0\u274c Стена снята", "$5M+"),
     }
 
     text = "\U0001f514 Настройки уведомлений\n\n"
     for at, (label, threshold) in labels.items():
         enabled = settings.get(at, True)
         icon = "\u2705 Вкл" if enabled else "\u274c Выкл"
-        text += f"{label} ({threshold})     [{icon}]\n"
+        thr_str = f" ({threshold})" if threshold else ""
+        text += f"{label}{thr_str}     [{icon}]\n"
 
     text += "\nНажмите для переключения:"
 
@@ -423,6 +426,23 @@ async def cmd_notify(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text(text, reply_markup=notify_keyboard(settings))
+
+
+async def cmd_topics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show forum topic IDs."""
+    text = "\U0001f4ac Telegram Topics\n\n"
+    if not config.TOPIC_IDS:
+        text += "Топики не настроены."
+    else:
+        for topic_key, thread_id in config.TOPIC_IDS.items():
+            text += f"  {topic_key}: thread_id={thread_id}\n"
+    text += f"\n\U0001f552 {fmt_time_msk()}"
+
+    msg = update.message or update.callback_query.message
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=back_keyboard())
+    else:
+        await msg.reply_text(text, reply_markup=back_keyboard())
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -438,11 +458,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/cvd — Cumulative Volume Delta\n"
         "/depth — Глубина ордербука\n"
         "/stats — Статистика по периодам\n"
-        "/notify — Настройки уведомлений\n\n"
-        "Алерты:\n"
+        "/notify — Настройки уведомлений\n"
+        "/topics — ID топиков форума\n\n"
+        "Алерты (в топики форума):\n"
         "  \U0001f9f1 Стены $2M+\n"
+        "  \U0001f3f0 Подтверждённые стены $5M+\n"
         "  \U0001f40b Сделки $500K+\n"
-        "  \U0001f480 Ликвидации $1M+\n"
+        "  \U0001f6a8 Мега-сделки $2M+\n"
+        "  \U0001f480 Ликвидации / Мега-ликвидации $1M+\n"
         "  \U0001f4ca CVD спайки $5M/5мин\n"
         "  \u2696\ufe0f Дисбаланс >40%"
     )

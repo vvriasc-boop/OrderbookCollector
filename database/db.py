@@ -128,15 +128,23 @@ def _create_tables(db: sqlite3.Connection):
             updated_at REAL NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS forum_topics (
+            topic_name TEXT PRIMARY KEY,
+            thread_id INTEGER NOT NULL,
+            created_at REAL NOT NULL
+        );
+
         INSERT OR IGNORE INTO notification_settings (alert_type, enabled, threshold_usd, updated_at) VALUES
             ('wall_new',        1, NULL, 0),
             ('wall_gone',       1, NULL, 0),
             ('large_trade',     1, NULL, 0),
             ('mega_trade',      1, NULL, 0),
             ('liquidation',     1, NULL, 0),
+            ('mega_liq',        1, NULL, 0),
             ('cvd_spike',       1, NULL, 0),
             ('imbalance',       1, NULL, 0),
-            ('confirmed_wall',  1, NULL, 0);
+            ('confirmed_wall',  1, NULL, 0),
+            ('confirmed_wall_gone', 1, NULL, 0);
     """)
 
 
@@ -346,6 +354,22 @@ async def get_db_size() -> float:
         return os.path.getsize("data.db") / (1024 * 1024)
     except OSError:
         return 0.0
+
+
+def db_get_all_topics() -> dict[str, int]:
+    """Return {topic_name: thread_id} from DB. Sync — called at startup."""
+    db = get_db()
+    rows = db.execute("SELECT topic_name, thread_id FROM forum_topics").fetchall()
+    return {row["topic_name"]: row["thread_id"] for row in rows}
+
+
+def db_save_topic(topic_name: str, thread_id: int):
+    """Save topic_name -> thread_id. Sync — called at startup."""
+    db = get_db()
+    db.execute(
+        "INSERT OR REPLACE INTO forum_topics (topic_name, thread_id, created_at) VALUES (?, ?, ?)",
+        (topic_name, thread_id, time.time()),
+    )
 
 
 def close_database():

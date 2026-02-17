@@ -18,7 +18,6 @@ class WallInfo:
     size_usd: float
     peak_size_usd: float
     detected_at: float
-    confirmed_alerted: bool = False
 
 
 @dataclass
@@ -362,42 +361,20 @@ class OrderBook:
                 })
             return walls
 
-    async def get_walls_for_confirmed_alert(self) -> list[dict]:
-        """Return walls eligible for confirmed_wall alert and mark them as alerted.
-
-        Criteria: age >= CONFIRMED_WALL_MIN_AGE_SEC, size >= CONFIRMED_WALL_THRESHOLD_USD,
-        within ±CONFIRMED_WALL_DISTANCE_PCT of mid price, not yet alerted.
-        """
+    async def check_wall_exists(self, price_str: str) -> dict | None:
+        """Check if a wall still exists and return its current data. For confirmed wall checker."""
         async with self.lock:
+            w = self.tracked_walls.get(price_str)
+            if not w:
+                return None
             mid = self._mid_price()
-            if mid <= 0:
-                return []
-            now = time.time()
-            result = []
-            for w in self.tracked_walls.values():
-                if w.confirmed_alerted:
-                    continue
-                age = now - w.detected_at
-                if age < config.CONFIRMED_WALL_MIN_AGE_SEC:
-                    continue
-                if w.size_usd < config.CONFIRMED_WALL_THRESHOLD_USD:
-                    continue
-                price_f = float(w.price_str)
-                distance = abs(price_f - mid) / mid
-                if distance > config.CONFIRMED_WALL_DISTANCE_PCT:
-                    continue
-                w.confirmed_alerted = True
-                result.append({
-                    "market": self.market,
-                    "side": w.side,
-                    "price": price_f,
-                    "price_str": w.price_str,
-                    "size_usd": w.size_usd,
-                    "distance_pct": (price_f - mid) / mid * 100,
-                    "age_sec": age,
-                    "detected_at": w.detected_at,
-                })
-            return result
+            price_f = float(price_str)
+            return {
+                "size_usd": w.size_usd,
+                "size_btc": w.size_btc,
+                "mid_price": mid,
+                "distance_pct": abs(price_f - mid) / mid * 100 if mid > 0 else 999,
+            }
 
     async def get_depth_display(self) -> dict:
         """Get depth data for /depth command."""
