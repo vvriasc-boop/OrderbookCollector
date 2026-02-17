@@ -8,7 +8,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 
 import config
 from database import db as database
-from services.orderbook import OrderBook, WallEvent, WallInfo
+from services.orderbook import OrderBook, WallEvent
 from services.trades import TradeAggregator
 from services.liquidations import on_liquidation
 from services.alerts import AlertManager, ConfirmedWallChecker

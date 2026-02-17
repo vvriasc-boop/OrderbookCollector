@@ -373,7 +373,7 @@ class OrderBook:
                 "size_usd": w.size_usd,
                 "size_btc": w.size_btc,
                 "mid_price": mid,
-                "distance_pct": abs(price_f - mid) / mid * 100 if mid > 0 else 999,
+                "distance_pct": (price_f - mid) / mid * 100 if mid > 0 else 999,
             }
 
     async def get_depth_display(self) -> dict:

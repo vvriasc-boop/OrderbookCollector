@@ -332,8 +332,8 @@ class ConfirmedWallChecker:
             return
         if mid_price <= 0:
             return
-        distance_pct = abs(event.price_float - mid_price) / mid_price * 100
-        if distance_pct > config.CONFIRMED_WALL_MAX_DISTANCE_PCT:
+        distance_pct = (event.price_float - mid_price) / mid_price * 100
+        if abs(distance_pct) > config.CONFIRMED_WALL_MAX_DISTANCE_PCT:
             return
 
         key = f"{event.market}:{event.side}:{event.price_str}"
@@ -369,7 +369,7 @@ class ConfirmedWallChecker:
         confirmed = []
         to_remove = []
 
-        for key, pw in self.pending.items():
+        for key, pw in list(self.pending.items()):
             if now - pw.detected_at < config.CONFIRMED_WALL_DELAY_SEC:
                 continue
 
@@ -387,7 +387,7 @@ class ConfirmedWallChecker:
                 to_remove.append(key)
                 continue
 
-            if wall_state["distance_pct"] > config.CONFIRMED_WALL_MAX_DISTANCE_PCT:
+            if abs(wall_state["distance_pct"]) > config.CONFIRMED_WALL_MAX_DISTANCE_PCT:
                 to_remove.append(key)
                 continue
 
