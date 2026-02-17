@@ -1,0 +1,10 @@
+.env
+data.db
+data.db-wal
+data.db-shm
+bot.log
+bot.log.*
+__pycache__/
+*.pyc
+.idea/
+.vscode/
