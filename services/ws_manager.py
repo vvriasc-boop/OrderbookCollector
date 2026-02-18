@@ -93,6 +93,7 @@ class WSManager:
 
                 logger.info("%s: WebSocket connected", market)
                 first_message_received = False
+                self.last_message_time[market] = time.time()  # reset watchdog timer
 
                 # Notify recovery if was down
                 if market in self._disconnect_time:
