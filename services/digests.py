@@ -3,12 +3,19 @@ import time
 import logging
 
 from database import db as database
-from utils.helpers import format_usd, format_price, format_pct
+from utils.helpers import format_usd, format_price
 
 logger = logging.getLogger("orderbook_collector")
 
 # Intervals in minutes
 DIGEST_INTERVALS = [15, 30, 60]
+
+# Distance bands for fresh walls breakdown
+DEPTH_BANDS = [
+    (1, "±1%", 0, 1),
+    (2, "±2%", 1, 2),
+    (5, "±5%", 2, 5),
+]
 
 
 def _plural_signals(n: int) -> str:
@@ -35,72 +42,133 @@ def _plural_alerts(n: int) -> str:
     return f"{n} алертов"
 
 
-def format_digest(interval_min: int, trades_rows: list, cvd_rows: list,
-                  price_data: dict, imbalance_data: dict, depth_data: dict,
-                  imbalance_alert_cnt: int) -> str:
-    """Format digest text from DB query results.
+def _delta_line(buy_usd: float, sell_usd: float) -> str:
+    """Format delta line: Δ = BUY - SELL."""
+    delta = buy_usd - sell_usd
+    sign = "+" if delta >= 0 else ""
+    label = "покупатели" if delta >= 0 else "продавцы"
+    return f"  Δ {sign}{format_usd(delta)} ({label})"
 
-    trades_rows: list of Row with (market, side, cnt, total_usd)
-    cvd_rows: list of Row with (market, delta)
-    price_data: {market: {"start": float, "end": float}}
-    imbalance_data: {market: float}  (imbalance_1pct, -1..+1)
-    depth_data: {market: {"bid": float, "ask": float}}
-    imbalance_alert_cnt: int
-    """
-    lines = [f"\U0001f4ca \u0414\u0430\u0439\u0434\u0436\u0435\u0441\u0442 {interval_min} \u043c\u0438\u043d\n"]
 
-    # --- Price change ---
-    if price_data:
-        lines.append("\U0001f4b0 \u0426\u0435\u043d\u0430 BTC:")
-        for market in ["futures", "spot"]:
-            pd = price_data.get(market)
-            if not pd or not pd["start"] or not pd["end"]:
-                continue
-            start_p = pd["start"]
-            end_p = pd["end"]
-            change_pct = (end_p - start_p) / start_p * 100 if start_p > 0 else 0
-            sign = "+" if change_pct >= 0 else ""
-            lines.append(
-                f"  {market.title()}: {format_price(start_p)} \u2192 {format_price(end_p)}"
-                f" ({sign}{change_pct:.2f}%)"
-            )
+def format_digest(interval_min: int, trades_rows: list, walls_rows: list,
+                  cvd_rows: list, price_data: dict, imbalance_data: dict,
+                  imbalance_alert_cnt: int, fresh_walls_rows: list) -> str:
+    """Format digest text from DB query results."""
+    lines = [f"📊 Дайджест {interval_min} мин\n"]
+
+    # --- Price change (futures only) ---
+    pd = price_data.get("futures")
+    if pd and pd["start"] and pd["end"]:
+        start_p = pd["start"]
+        end_p = pd["end"]
+        change_pct = (end_p - start_p) / start_p * 100 if start_p > 0 else 0
+        sign = "+" if change_pct >= 0 else ""
+        lines.append(
+            f"💰 Цена BTC: {format_price(start_p)} → {format_price(end_p)}"
+            f" ({sign}{change_pct:.2f}%)"
+        )
         lines.append("")
 
     # --- Trades ---
     if trades_rows:
-        lines.append("\U0001f40b \u041a\u0440\u0443\u043f\u043d\u044b\u0435 \u0441\u0434\u0435\u043b\u043a\u0438:")
+        lines.append("🐋 Крупные сделки:")
         total_cnt = 0
         total_usd = 0.0
+        market_sides: dict[str, dict[str, float]] = {}
         for row in trades_rows:
-            market = row["market"].title()
-            side = row["side"].upper()
+            market = row["market"]
+            side = row["side"]
             cnt = row["cnt"]
             vol = row["total_usd"]
-            lines.append(f"  {market} {side}: {_plural_signals(cnt)}, {format_usd(vol)}")
+            lines.append(f"  {market.title()} {side.upper()}: {_plural_signals(cnt)}, {format_usd(vol)}")
             total_cnt += cnt
             total_usd += vol
-        lines.append(f"  \u0418\u0442\u043e\u0433\u043e: {_plural_signals(total_cnt)}, {format_usd(total_usd)}")
+            market_sides.setdefault(market, {"buy": 0.0, "sell": 0.0})
+            market_sides[market][side] = vol
+        lines.append(f"  Итого: {_plural_signals(total_cnt)}, {format_usd(total_usd)}")
+        for market in sorted(market_sides):
+            ms = market_sides[market]
+            lines.append(f"  {market.title()} {_delta_line(ms.get('buy', 0), ms.get('sell', 0)).strip()}")
     else:
-        lines.append("\U0001f40b \u041a\u0440\u0443\u043f\u043d\u044b\u0435 \u0441\u0434\u0435\u043b\u043a\u0438: \u043d\u0435\u0442")
+        lines.append("🐋 Крупные сделки: нет")
+
+    lines.append("")
+
+    # --- Walls (orderbook) ---
+    if walls_rows:
+        lines.append("🧱 Стакан (стены):")
+        total_cnt = 0
+        total_usd = 0.0
+        market_sides_w: dict[str, dict[str, float]] = {}
+        for row in walls_rows:
+            market = row["market"]
+            side = row["side"]
+            cnt = row["cnt"]
+            vol = row["total_usd"]
+            lines.append(f"  {market.title()} {side.upper()}: {_plural_signals(cnt)}, {format_usd(vol)}")
+            total_cnt += cnt
+            total_usd += vol
+            market_sides_w.setdefault(market, {"bid": 0.0, "ask": 0.0})
+            market_sides_w[market][side] = vol
+        lines.append(f"  Итого: {_plural_signals(total_cnt)}, {format_usd(total_usd)}")
+        for market in sorted(market_sides_w):
+            ms = market_sides_w[market]
+            lines.append(f"  {market.title()} {_delta_line(ms.get('bid', 0), ms.get('ask', 0)).strip()}")
+    else:
+        lines.append("🧱 Стакан (стены): нет")
+
+    lines.append("")
+
+    # --- Fresh walls by depth band (±1%, ±2%, ±5%) ---
+    # Rows have: depth_band, market, side, cnt, total_usd
+    if fresh_walls_rows:
+        lines.append("📏 Фреши по глубине (≥60 сек):")
+        # Group by band
+        bands: dict[str, list] = {}
+        for row in fresh_walls_rows:
+            band = row["depth_band"]
+            bands.setdefault(band, []).append(row)
+
+        for _order, label, _lo, _hi in DEPTH_BANDS:
+            band_key = str(_order)
+            band_rows = bands.get(band_key, [])
+            if not band_rows:
+                lines.append(f"  {label}: нет")
+                continue
+            lines.append(f"  {label}:")
+            market_sides_f: dict[str, dict[str, float]] = {}
+            for row in band_rows:
+                market = row["market"]
+                side = row["side"]
+                cnt = row["cnt"]
+                vol = row["total_usd"]
+                lines.append(f"    {market.title()} {side.upper()}: {_plural_signals(cnt)}, {format_usd(vol)}")
+                market_sides_f.setdefault(market, {"bid": 0.0, "ask": 0.0})
+                market_sides_f[market][side] = vol
+            for market in sorted(market_sides_f):
+                ms = market_sides_f[market]
+                lines.append(f"    {market.title()} {_delta_line(ms.get('bid', 0), ms.get('ask', 0)).strip()}")
+    else:
+        lines.append("📏 Фреши по глубине (≥60 сек): нет")
 
     lines.append("")
 
     # --- CVD ---
     if cvd_rows:
-        lines.append("\U0001f4c8 CVD (\u0434\u0435\u043b\u044c\u0442\u0430 \u0437\u0430 \u043f\u0435\u0440\u0438\u043e\u0434):")
+        lines.append("📈 CVD (дельта за период):")
         for row in cvd_rows:
             market = row["market"].title()
             delta = row["delta"]
             sign = "+" if delta >= 0 else ""
-            label = "\u043f\u043e\u043a\u0443\u043f\u0430\u0442\u0435\u043b\u0438" if delta >= 0 else "\u043f\u0440\u043e\u0434\u0430\u0432\u0446\u044b"
+            label = "покупатели" if delta >= 0 else "продавцы"
             lines.append(f"  {market}: {sign}{format_usd(delta)} ({label})")
     else:
-        lines.append("\U0001f4c8 CVD: \u043d\u0435\u0442 \u0434\u0430\u043d\u043d\u044b\u0445")
+        lines.append("📈 CVD: нет данных")
 
     lines.append("")
 
     # --- Imbalance ---
-    lines.append("\u2696\ufe0f \u0414\u0438\u0441\u0431\u0430\u043b\u0430\u043d\u0441 (\u00b11%):")
+    lines.append("⚖️ Дисбаланс (±1%):")
     if imbalance_data:
         for market in ["futures", "spot"]:
             imb = imbalance_data.get(market)
@@ -109,49 +177,64 @@ def format_digest(interval_min: int, trades_rows: list, cvd_rows: list,
             bid_pct = int((1 + imb) / 2 * 100)
             ask_pct = 100 - bid_pct
             if imb > 0.05:
-                label = "\u043f\u0435\u0440\u0435\u0432\u0435\u0441 \u043f\u043e\u043a\u0443\u043f\u0430\u0442\u0435\u043b\u0435\u0439"
+                label = "перевес покупателей"
             elif imb < -0.05:
-                label = "\u043f\u0435\u0440\u0435\u0432\u0435\u0441 \u043f\u0440\u043e\u0434\u0430\u0432\u0446\u043e\u0432"
+                label = "перевес продавцов"
             else:
-                label = "\u0440\u0430\u0432\u043d\u043e\u0432\u0435\u0441\u0438\u0435"
+                label = "равновесие"
             lines.append(f"  {market.title()}: BID {bid_pct}% / ASK {ask_pct}% ({label})")
     else:
-        lines.append("  \u043d\u0435\u0442 \u0434\u0430\u043d\u043d\u044b\u0445")
+        lines.append("  нет данных")
 
     if imbalance_alert_cnt > 0:
-        lines.append(f"  \u26a0\ufe0f \u0410\u043d\u043e\u043c\u0430\u043b\u0438\u0438: {_plural_alerts(imbalance_alert_cnt)}")
-
-    lines.append("")
-
-    # --- Depth delta (bid vs ask) ---
-    lines.append("\U0001f4ca \u0413\u043b\u0443\u0431\u0438\u043d\u0430 (\u00b11%):")
-    if depth_data:
-        for market in ["futures", "spot"]:
-            dd = depth_data.get(market)
-            if not dd:
-                continue
-            bid_d = dd["bid"]
-            ask_d = dd["ask"]
-            delta = bid_d - ask_d
-            sign = "+" if delta >= 0 else ""
-            lines.append(
-                f"  {market.title()}: BID {format_usd(bid_d)} / ASK {format_usd(ask_d)}"
-                f" (\u0394 {sign}{format_usd(delta)})"
-            )
-    else:
-        lines.append("  \u043d\u0435\u0442 \u0434\u0430\u043d\u043d\u044b\u0445")
+        lines.append(f"  ⚠️ Аномалии: {_plural_alerts(imbalance_alert_cnt)}")
 
     return "\n".join(lines)
 
 
 async def _build_digest(interval_min: int, cutoff_ts: float) -> str:
     """Query DB and build digest text for one interval."""
-    # --- Trades ---
+    now = time.time()
+
+    # --- Trades (futures >= $500K, spot >= $100K) ---
     trades_rows = await database.fetchall(
         "SELECT market, side, COUNT(*) as cnt, SUM(quantity_usd) as total_usd "
         "FROM large_trades WHERE timestamp >= ? "
+        "  AND quantity_usd >= CASE WHEN market = 'futures' THEN 500000 ELSE 100000 END "
         "GROUP BY market, side ORDER BY market, side",
         (cutoff_ts,),
+    )
+
+    # --- Walls (futures >= $2M, spot >= $500K) ---
+    walls_rows = await database.fetchall(
+        "SELECT market, side, COUNT(*) as cnt, SUM(size_usd) as total_usd "
+        "FROM orderbook_walls WHERE detected_at >= ? "
+        "  AND size_usd >= CASE WHEN market = 'futures' THEN 2000000 ELSE 500000 END "
+        "GROUP BY market, side ORDER BY market, side",
+        (cutoff_ts,),
+    )
+
+    # --- Fresh walls by depth band (stood >= 60 sec, within ±5%) ---
+    # Futures >= $2M, spot >= $500K
+    fresh_walls_rows = await database.fetchall(
+        "SELECT "
+        "  CASE "
+        "    WHEN abs(distance_pct) <= 1 THEN '1' "
+        "    WHEN abs(distance_pct) <= 2 THEN '2' "
+        "    ELSE '5' "
+        "  END as depth_band, "
+        "  market, side, COUNT(*) as cnt, SUM(size_usd) as total_usd "
+        "FROM orderbook_walls "
+        "WHERE detected_at >= ? "
+        "  AND abs(distance_pct) <= 5 "
+        "  AND size_usd >= CASE WHEN market = 'futures' THEN 2000000 ELSE 500000 END "
+        "  AND ("
+        "    (status = 'active' AND (? - detected_at) >= 60) "
+        "    OR (status != 'active' AND COALESCE(lifetime_sec, 0) >= 60)"
+        "  ) "
+        "GROUP BY depth_band, market, side "
+        "ORDER BY depth_band, market, side",
+        (cutoff_ts, now),
     )
 
     # --- CVD ---
@@ -162,19 +245,24 @@ async def _build_digest(interval_min: int, cutoff_ts: float) -> str:
         (cutoff_ts,),
     )
 
-    # --- Price at start of period (earliest snapshot per market after cutoff) ---
-    price_start_rows = await database.fetchall(
-        "SELECT market, mid_price FROM ob_snapshots_1m "
-        "WHERE (market, timestamp) IN ("
-        "  SELECT market, MIN(timestamp) FROM ob_snapshots_1m "
-        "  WHERE timestamp >= ? GROUP BY market"
-        ")",
+    # --- Price at start of period (futures only) ---
+    price_start_row = await database.fetchone(
+        "SELECT mid_price FROM ob_snapshots_1m "
+        "WHERE market = 'futures' AND timestamp >= ? "
+        "ORDER BY timestamp ASC LIMIT 1",
         (cutoff_ts,),
     )
 
-    # --- Latest snapshot per market (current price, imbalance, depth) ---
-    latest_rows = await database.fetchall(
-        "SELECT market, mid_price, imbalance_1pct, bid_depth_1pct, ask_depth_1pct "
+    # --- Latest futures snapshot (current price) ---
+    latest_row = await database.fetchone(
+        "SELECT mid_price FROM ob_snapshots_1m "
+        "WHERE market = 'futures' "
+        "ORDER BY timestamp DESC LIMIT 1",
+    )
+
+    # --- Latest snapshot per market (imbalance) ---
+    latest_imb_rows = await database.fetchall(
+        "SELECT market, imbalance_1pct "
         "FROM ob_snapshots_1m "
         "WHERE (market, timestamp) IN ("
         "  SELECT market, MAX(timestamp) FROM ob_snapshots_1m GROUP BY market"
@@ -189,31 +277,21 @@ async def _build_digest(interval_min: int, cutoff_ts: float) -> str:
     )
     imbalance_alert_cnt = imb_alert_row["cnt"] if imb_alert_row else 0
 
-    # Build price_data
+    # Build price_data (futures only)
     price_data: dict = {}
-    for row in price_start_rows:
-        price_data[row["market"]] = {"start": row["mid_price"], "end": None}
-    for row in latest_rows:
-        m = row["market"]
-        if m not in price_data:
-            price_data[m] = {"start": row["mid_price"], "end": row["mid_price"]}
-        else:
-            price_data[m]["end"] = row["mid_price"]
+    start_p = price_start_row["mid_price"] if price_start_row else None
+    end_p = latest_row["mid_price"] if latest_row else None
+    if start_p and end_p:
+        price_data["futures"] = {"start": start_p, "end": end_p}
 
-    # Build imbalance_data and depth_data
+    # Build imbalance_data
     imbalance_data: dict = {}
-    depth_data: dict = {}
-    for row in latest_rows:
-        m = row["market"]
-        imbalance_data[m] = row["imbalance_1pct"]
-        depth_data[m] = {
-            "bid": row["bid_depth_1pct"] or 0,
-            "ask": row["ask_depth_1pct"] or 0,
-        }
+    for row in latest_imb_rows:
+        imbalance_data[row["market"]] = row["imbalance_1pct"]
 
     return format_digest(
-        interval_min, trades_rows, cvd_rows,
-        price_data, imbalance_data, depth_data, imbalance_alert_cnt,
+        interval_min, trades_rows, walls_rows, cvd_rows,
+        price_data, imbalance_data, imbalance_alert_cnt, fresh_walls_rows,
     )
 
 

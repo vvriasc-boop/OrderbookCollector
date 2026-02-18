@@ -51,7 +51,8 @@ REQUIRED_TOPICS = {
     "trades_spot_sell": "🐋 Сделки Spot SELL",
     "mega_events": "🚨 Мега-события",
     "liquidations": "💀 Ликвидации",
-    "cvd_imbalance": "📊 CVD / Дисбаланс",
+    "cvd": "📈 CVD",
+    "imbalance": "⚖️ Дисбаланс",
     "digests": "📋 Дайджесты",
     "digest_15m": "📊 Дайджест 15 мин",
     "digest_30m": "📊 Дайджест 30 мин",
@@ -280,6 +281,7 @@ async def main():
         on_trade=handle_trade,
         on_liquidation=handle_liquidation,
         on_snapshot_needed=handle_snapshot_needed,
+        alert_manager=alert_manager,
     )
 
     # Store shared context for Telegram handlers

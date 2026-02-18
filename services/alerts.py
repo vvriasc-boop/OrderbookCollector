@@ -65,8 +65,8 @@ ALERT_TO_TOPIC = {
     "mega_trade":           "mega_events",
     "liquidation":          "liquidations",
     "mega_liq":             "mega_events",
-    "cvd_spike":            "cvd_imbalance",
-    "imbalance":            "cvd_imbalance",
+    "cvd_spike":            "cvd",
+    "imbalance":            "imbalance",
     "system":               "system",
     "digest":               "digests",
 }

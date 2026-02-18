@@ -21,11 +21,13 @@ class WSManager:
         on_trade: Callable,
         on_liquidation: Callable,
         on_snapshot_needed: Callable,
+        alert_manager=None,
     ):
         self.on_depth = on_depth
         self.on_trade = on_trade
         self.on_liquidation = on_liquidation
         self.on_snapshot_needed = on_snapshot_needed
+        self.alert_manager = alert_manager
         self._tasks: list[asyncio.Task] = []
         self._running = False
         self.futures_connected = False
@@ -33,6 +35,8 @@ class WSManager:
         self.futures_uptime_start: float = 0
         self.spot_uptime_start: float = 0
         self.last_message_time: dict[str, float] = {"futures": 0, "spot": 0}
+        self._disconnect_time: dict[str, float] = {}  # market -> time of disconnect
+        self._alert_sent: dict[str, bool] = {}  # market -> whether disconnect alert sent
 
     async def start(self):
         """Start both connections in parallel."""
@@ -57,12 +61,21 @@ class WSManager:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
 
+    async def _notify(self, text: str):
+        """Send notification to system topic (fire-and-forget)."""
+        if self.alert_manager:
+            try:
+                await self.alert_manager.send_system_message(text)
+            except Exception as e:
+                logger.error("Failed to send system alert: %s", e)
+
     async def _run_connection(self, url: str, market: str):
         """Single WebSocket with auto-reconnect and exponential backoff."""
         delay = config.WS_RECONNECT_DELAY_SEC
         first_message_received = False
 
         while self._running:
+            disconnect_reason = "unknown"
             try:
                 logger.info("%s: connecting to WebSocket...", market)
                 ws = await config.http_session.ws_connect(
@@ -80,6 +93,16 @@ class WSManager:
 
                 logger.info("%s: WebSocket connected", market)
                 first_message_received = False
+
+                # Notify recovery if was down
+                if market in self._disconnect_time:
+                    down_sec = time.time() - self._disconnect_time[market]
+                    await self._notify(
+                        f"✅ {market.title()} WS восстановлен\n"
+                        f"⏱ Даунтайм: {int(down_sec)} сек"
+                    )
+                    self._disconnect_time.pop(market, None)
+                    self._alert_sent.pop(market, None)
 
                 # Request snapshot after connection
                 await self.on_snapshot_needed(market)
@@ -110,22 +133,40 @@ class WSManager:
                             logger.error("%s: message processing error: %s", market, e)
 
                     elif msg.type == aiohttp.WSMsgType.ERROR:
-                        logger.error("%s: WS error: %s", market, ws.exception())
+                        disconnect_reason = f"WS error: {ws.exception()}"
+                        logger.error("%s: %s", market, disconnect_reason)
                         break
                     elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED):
+                        disconnect_reason = "WS closed by server"
                         logger.warning("%s: WS closed", market)
                         break
 
             except asyncio.CancelledError:
-                raise
+                if not self._running:
+                    raise  # stop() called — exit for real
+                # Watchdog forced reconnect — don't die, loop back
+                logger.info("%s: forced reconnect by watchdog", market)
+                disconnect_reason = "silence (no data)"
+                delay = config.WS_RECONNECT_DELAY_SEC  # reset backoff
             except Exception as e:
                 logger.error("%s: WS connection error: %s", market, e)
+                disconnect_reason = str(e)
 
             # Mark disconnected
             if market == "futures":
                 self.futures_connected = False
             else:
                 self.spot_connected = False
+
+            # Track disconnect time, send alert once
+            if market not in self._disconnect_time:
+                self._disconnect_time[market] = time.time()
+            if not self._alert_sent.get(market):
+                self._alert_sent[market] = True
+                await self._notify(
+                    f"🔴 {market.title()} WS отключён\n"
+                    f"📛 Причина: {disconnect_reason}"
+                )
 
             if not self._running:
                 break
