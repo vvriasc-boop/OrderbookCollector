@@ -22,7 +22,8 @@ OrderbookCollector/
 │   ├── trades.py        ← агрегация сделок, CVD, крупные сделки
 │   ├── liquidations.py  ← фильтрация и хранение ликвидаций
 │   ├── alerts.py        ← AlertManager, ConfirmedWallChecker, SpoofTracker
-│   └── snapshots.py     ← REST снапшоты, периодические задачи, confirmed_wall_check_loop
+│   ├── snapshots.py     ← REST снапшоты, periodic refresh, snapshot_recovery_loop
+│   └── digests.py       ← периодические дайджесты 15/30/60 мин
 ├── handlers/
 │   ├── __init__.py
 │   ├── commands.py      ← /start /status /walls /trades /liq /cvd /depth /stats /notify /topics /help
@@ -30,7 +31,7 @@ OrderbookCollector/
 │   └── keyboards.py     ← InlineKeyboardMarkup
 └── utils/
     ├── __init__.py
-    └── helpers.py        ← форматирование, split_text, fmt_time_msk
+    └── helpers.py        ← форматирование, split_text
 ```
 
 ## Запуск
@@ -65,7 +66,7 @@ journalctl -u orderbook-collector -f   # логи
 
 ## Telegram Forum Topics
 
-Алерты маршрутизируются в 15 отдельных топиков. Топики создаются автоматически при первом запуске через `ensure_forum_topics()`, thread_id сохраняются в таблицу `forum_topics`.
+Алерты маршрутизируются в 18 отдельных топиков. Топики создаются автоматически при первом запуске через `ensure_forum_topics()`, thread_id сохраняются в таблицу `forum_topics`.
 
 ### Маршрутизация алертов
 
@@ -84,7 +85,10 @@ journalctl -u orderbook-collector -f   # логи
 | `mega_events` | Мега-сделки + мега-ликвидации | ALERT_TO_TOPIC static |
 | `liquidations` | Ликвидации | ALERT_TO_TOPIC static |
 | `cvd_imbalance` | CVD / Дисбаланс | ALERT_TO_TOPIC static |
-| `digests` | Дайджесты | ALERT_TO_TOPIC static |
+| `digests` | Дайджесты (legacy) | ALERT_TO_TOPIC static |
+| `digest_15m` | Дайджест каждые 15 мин | topic_key override |
+| `digest_30m` | Дайджест каждые 30 мин | topic_key override |
+| `digest_60m` | Дайджест каждые 60 мин | topic_key override |
 | `system` | Системные сообщения | ALERT_TO_TOPIC static |
 
 **Два механизма маршрутизации:**
@@ -148,6 +152,20 @@ Binance combined stream оборачивает события:
 - **Exponential backoff**: WS reconnect 5→10→20→...→300 сек. Сброс при первом сообщении.
 - **Pruning**: раз в минуту удаляются уровни дальше 50% от mid_price (memory management).
 - **Batching alerts**: если >3 алертов одного типа за 0.3 сек — объединяются в одно сообщение. Группировка по (alert_type, topic_key).
+- **OB sync protection**: при periodic REST refresh — `invalidate()` → буферизация WS → snapshot → обработка буфера. Плюс `snapshot_recovery_loop` (5 сек) для авто-восстановления при любом gap.
+- **Нет времени в алертах**: московское время убрано — Telegram показывает timestamp нативно.
+
+## Периодические дайджесты (services/digests.py)
+
+Каждые 15, 30 и 60 минут (выровнены по часам) публикуется отчёт в отдельный Forum Topic. Содержимое:
+
+- **Цена BTC**: начало/конец периода + % изменения (из `ob_snapshots_1m.mid_price`)
+- **Крупные сделки**: кол-во сигналов + суммарный объём по market×side (из `large_trades`)
+- **CVD**: дельта за период по market (из `trade_aggregates_1m.delta_usd`)
+- **Дисбаланс**: текущий BID/ASK% + кол-во алертов-аномалий (из `ob_snapshots_1m.imbalance_1pct` + `alerts_log`)
+- **Глубина**: BID/ASK depth ±1% + дельта (из `ob_snapshots_1m.bid_depth_1pct/ask_depth_1pct`)
+
+`digest_loop` — единый цикл, проверяет границы 15/30/60 мин каждые 30 сек. Отправка через `alert_manager.send_digest(text, topic_key)`.
 
 ## Разница Futures vs Spot diff-логики
 
@@ -170,6 +188,8 @@ python3 -m py_compile config.py
 python3 -m py_compile database/db.py
 python3 -m py_compile services/orderbook.py
 python3 -m py_compile services/alerts.py
+python3 -m py_compile services/snapshots.py
+python3 -m py_compile services/digests.py
 
 # Запуск (ручной)
 python main.py
@@ -183,6 +203,7 @@ sudo systemctl restart orderbook-collector
 - **get_wall_info() ПЕРЕД unregister_wall()**: при обработке снятия стены в `_process_wall_event`, данные о стене (detected_at для возраста) нужно получить ДО вызова `unregister_wall()`, иначе данные потеряны.
 - **list() при итерации dict с await**: `for key, val in self.pending.items()` с `await` внутри цикла — RuntimeError. Использовать `list(self.pending.items())`.
 - **distance_pct — знаковая величина**: не использовать `abs()` при сохранении distance_pct. Знак нужен для отображения "ниже"/"выше". Фильтры используют `abs()` явно.
+- **invalidate() ПЕРЕД periodic REST refresh**: в `periodic_rest_refresh` обязательно `await ob.invalidate()` перед `fetch_rest_snapshot()`. Без этого WS-события не буферизуются → gap → OB недоступен до следующего refresh (~1 час).
 
 ## Lessons Learned
 
@@ -193,6 +214,14 @@ sudo systemctl restart orderbook-collector
 - **Причина:** `await` внутри цикла отдаёт управление, другой корутин модифицирует dict
 - **Решение:** `for key, pw in list(self.pending.items()):`
 - **При повторении:** Любой `for ... in dict.items()` с `await` внутри — обернуть в `list()`
+
+### WebSocket
+**[2026-02-18]** Spot OB sync loss after hourly REST refresh
+
+- **Симптом:** Spot OB "not ready" на ~59 мин из каждого часа после periodic REST refresh
+- **Причина:** `apply_snapshot()` вызывался пока OB в `ready=True` → WS не буферизовались → после замены `last_update_id` следующий WS diff имеет `U >> expected` → gap → `ready=False`
+- **Решение:** `invalidate()` перед `fetch_rest_snapshot()` + `snapshot_recovery_loop` (5 сек)
+- **При повторении:** При любой замене состояния в реальном времени — сначала остановить приём событий (буферизация), затем заменить состояние, затем обработать буфер
 
 ### Config
 **[2026-02-18]** FORUM_GROUP_ID: "The chat is not a forum"

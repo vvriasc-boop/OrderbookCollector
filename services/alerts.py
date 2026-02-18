@@ -12,7 +12,7 @@ from services.trades import LargeTradeEvent
 from services.liquidations import LiqEvent
 from utils.helpers import (
     format_usd, format_price, format_duration, format_pct,
-    fmt_time_msk, delta_arrow, split_text,
+    delta_arrow, split_text,
 )
 
 logger = logging.getLogger("orderbook_collector")
@@ -116,7 +116,6 @@ class AlertManager:
                 lines.append(f"\U0001f4cf Расстояние: {format_pct(abs(distance_pct))} {dist_dir}")
             if spoof_count >= 2:
                 lines.append(f"\u26a0\ufe0f Спуфинг? (замечена {spoof_count} раз за час)")
-            lines.append(f"\U0001f552 {fmt_time_msk()}")
             topic = f"walls_{event.market}_{event.side}"
             await self._enqueue(alert_type, "\n".join(lines), topic_key=topic)
 
@@ -142,7 +141,6 @@ class AlertManager:
             lines.append(f"\U0001f4ca Причина: {reason_map.get(event.event_type, event.event_type)}")
             if spoof_count >= 2:
                 lines.append(f"\u26a0\ufe0f Спуфинг? (замечена {spoof_count} раз за час)")
-            lines.append(f"\U0001f552 {fmt_time_msk()}")
             topic = f"walls_{event.market}_{event.side}"
             await self._enqueue(alert_type, "\n".join(lines), topic_key=topic)
 
@@ -163,8 +161,7 @@ class AlertManager:
         text = (
             f"{emoji} {label} — {event.market.title()}\n"
             f"{arrow} {event.side.upper()} {format_usd(event.quantity_usd)}"
-            f" @ {format_price(event.price)}\n"
-            f"\U0001f552 {fmt_time_msk(event.timestamp)}"
+            f" @ {format_price(event.price)}"
         )
         topic = f"trades_{event.market}_{event.side}"
         await self._enqueue(alert_type, text, topic_key=topic)
@@ -184,8 +181,7 @@ class AlertManager:
         text = (
             f"\U0001f480 ЛИКВИДАЦИЯ — Futures\n"
             f"{arrow} {event.side.upper()} {format_usd(event.quantity_usd)}"
-            f" @ {format_price(event.price)}\n"
-            f"\U0001f552 {fmt_time_msk(event.timestamp)}"
+            f" @ {format_price(event.price)}"
         )
         await self._enqueue(alert_type, text)
 
@@ -202,8 +198,7 @@ class AlertManager:
         buyer_seller = "покупатели" if delta_5m > 0 else "продавцы"
         text = (
             f"\U0001f4ca CVD ВСПЛЕСК — {market.title()}\n"
-            f"{arrow} {sign}{format_usd(delta_5m)} за 5 мин ({buyer_seller})\n"
-            f"\U0001f552 {fmt_time_msk()}"
+            f"{arrow} {sign}{format_usd(delta_5m)} за 5 мин ({buyer_seller})"
         )
         await self._enqueue(alert_type, text)
 
@@ -221,8 +216,7 @@ class AlertManager:
         dominant = "BID перевес" if imb > 0 else "ASK перевес"
         text = (
             f"\u2696\ufe0f ДИСБАЛАНС — {market.title()}\n"
-            f"{arrow} {dominant} {bid_pct}% / {ask_pct}% (\u00b11%)\n"
-            f"\U0001f552 {fmt_time_msk()}"
+            f"{arrow} {dominant} {bid_pct}% / {ask_pct}% (\u00b11%)"
         )
         await self._enqueue(alert_type, text)
 
@@ -240,9 +234,7 @@ class AlertManager:
             f"\U0001f3f0 ПОДТВЕРЖДЁННАЯ СТЕНА — {wall_data['market'].title()} {side_label}\n"
             f"\U0001f4b0 {format_usd(wall_data['size_usd'])} @ {format_price(wall_data['price'])}\n"
             f"\U0001f4cf Расстояние: {format_pct(abs(dist))} {dist_dir}\n"
-            f"\u23f1 Стоит уже: {format_duration(wall_data['age_sec'])}\n"
-            f"\U0001f552 Обнаружена: {fmt_time_msk(wall_data['detected_at'])}\n"
-            f"\U0001f552 Подтверждена: {fmt_time_msk()}"
+            f"\u23f1 Стоит уже: {format_duration(wall_data['age_sec'])}"
         )
         topic = f"confirmed_walls_{wall_data['market']}"
         await self._enqueue(alert_type, text, topic_key=topic)
@@ -265,16 +257,18 @@ class AlertManager:
             f"\U0001f3f0\u274c СТЕНА СНЯТА — {wall_data['market'].title()} {side_label}\n"
             f"\U0001f4b0 {format_usd(wall_data['size_usd'])} @ {format_price(wall_data['price'])}\n"
             f"\u23f1 Жила: {format_duration(age)}\n"
-            f"\U0001f4ca Причина: {reason_map.get(reason, reason)}\n"
-            f"\U0001f552 {fmt_time_msk()}"
+            f"\U0001f4ca Причина: {reason_map.get(reason, reason)}"
         )
         topic = f"confirmed_walls_{wall_data['market']}"
         await self._enqueue(alert_type, text, topic_key=topic)
 
     async def send_system_message(self, text: str):
         """Send message to system topic."""
-        text += f"\n\U0001f552 {fmt_time_msk()}"
         await self._enqueue("system", text)
+
+    async def send_digest(self, text: str, topic_key: str):
+        """Send digest message to specific topic."""
+        await self._enqueue("digest", text, topic_key=topic_key)
 
     # --- Internal ---
 

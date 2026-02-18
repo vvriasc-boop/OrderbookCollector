@@ -9,7 +9,7 @@ from database import db as database
 from handlers.keyboards import main_menu_keyboard, stats_period_keyboard, notify_keyboard, back_keyboard
 from utils.helpers import (
     format_usd, format_price, format_duration, format_pct,
-    delta_arrow, imbalance_bar, split_text, fmt_time_msk,
+    delta_arrow, imbalance_bar, split_text,
 )
 
 logger = logging.getLogger("orderbook_collector")
@@ -436,7 +436,6 @@ async def cmd_topics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         for topic_key, thread_id in config.TOPIC_IDS.items():
             text += f"  {topic_key}: thread_id={thread_id}\n"
-    text += f"\n\U0001f552 {fmt_time_msk()}"
 
     msg = update.message or update.callback_query.message
     if update.callback_query:

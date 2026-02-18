@@ -128,10 +128,14 @@ async def periodic_rest_refresh(ob_futures, ob_spot):
             await asyncio.sleep(config.REST_SNAPSHOT_INTERVAL_SEC)
 
             for ob, market in [(ob_futures, "futures"), (ob_spot, "spot")]:
+                # Invalidate first so WS events get buffered during REST call
+                await ob.invalidate()
                 snap = await fetch_rest_snapshot(market)
                 if snap:
                     await ob.apply_snapshot(snap)
                     logger.info("%s: periodic REST refresh done", market)
+                else:
+                    logger.error("%s: periodic REST refresh failed, OB remains invalid", market)
                 await asyncio.sleep(1)  # rate limit
 
         except asyncio.CancelledError:
@@ -139,6 +143,29 @@ async def periodic_rest_refresh(ob_futures, ob_spot):
         except Exception as e:
             logger.error("periodic_rest_refresh error: %s", e)
             await asyncio.sleep(60)
+
+
+async def snapshot_recovery_loop(ob_futures, ob_spot):
+    """Quick re-snapshot when OB loses sync (gap detected)."""
+    while True:
+        try:
+            await asyncio.sleep(5)
+            for ob, market in [(ob_futures, "futures"), (ob_spot, "spot")]:
+                # Only recover if OB was initialized before (last_update_id > 0)
+                if ob.last_update_id > 0 and not await ob.is_ready():
+                    logger.info("%s: not ready, fetching recovery snapshot...", market)
+                    snap = await fetch_rest_snapshot(market)
+                    if snap:
+                        await ob.apply_snapshot(snap)
+                        logger.info("%s: recovery snapshot applied", market)
+                    else:
+                        logger.error("%s: recovery snapshot failed", market)
+                    await asyncio.sleep(2)  # rate limit between recovery attempts
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("snapshot_recovery_loop error: %s", e)
+            await asyncio.sleep(5)
 
 
 async def periodic_archive_cleanup():

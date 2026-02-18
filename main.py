@@ -19,7 +19,9 @@ from services.snapshots import (
     periodic_rest_refresh,
     periodic_archive_cleanup,
     confirmed_wall_check_loop,
+    snapshot_recovery_loop,
 )
+from services.digests import digest_loop
 from handlers.commands import (
     cmd_start, cmd_status, cmd_walls, cmd_trades,
     cmd_liq, cmd_cvd, cmd_depth, cmd_stats, cmd_notify, cmd_help, cmd_topics,
@@ -51,6 +53,9 @@ REQUIRED_TOPICS = {
     "liquidations": "💀 Ликвидации",
     "cvd_imbalance": "📊 CVD / Дисбаланс",
     "digests": "📋 Дайджесты",
+    "digest_15m": "📊 Дайджест 15 мин",
+    "digest_30m": "📊 Дайджест 30 мин",
+    "digest_60m": "📊 Дайджест 60 мин",
     "system": "⚙️ Система",
 }
 
@@ -313,6 +318,7 @@ async def main():
             name="snapshot-loop",
         ),
         asyncio.create_task(periodic_rest_refresh(ob_futures, ob_spot), name="rest-refresh"),
+        asyncio.create_task(snapshot_recovery_loop(ob_futures, ob_spot), name="snapshot-recovery"),
         asyncio.create_task(periodic_archive_cleanup(), name="archive-cleanup"),
         asyncio.create_task(_healthcheck_loop(ws_manager, ob_futures, ob_spot, alert_manager),
                            name="healthcheck"),
@@ -320,6 +326,7 @@ async def main():
             confirmed_wall_check_loop(confirmed_wall_checker, orderbooks, alert_manager),
             name="confirmed-wall-checker",
         ),
+        asyncio.create_task(digest_loop(alert_manager), name="digest-loop"),
     ]
 
     # 11. Start Telegram bot
